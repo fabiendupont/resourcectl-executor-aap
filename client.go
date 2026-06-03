@@ -19,6 +19,8 @@ type ClientConfig struct {
 	Auth    AuthMethod
 	TLS     TLSConfig
 	Timeout time.Duration
+	Retry   *RetryConfig
+	Circuit *CircuitConfig
 }
 
 // Client talks to the AAP Controller REST API.
@@ -45,6 +47,13 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		transport = t
 	}
 
+	// Chain transports: TLS → circuit breaker → retry → correlation
+	if cfg.Circuit != nil {
+		transport = WithCircuitBreaker(transport, *cfg.Circuit)
+	}
+	if cfg.Retry != nil {
+		transport = WithRetry(transport, *cfg.Retry)
+	}
 	transport = &correlationTransport{base: transport}
 
 	return &Client{

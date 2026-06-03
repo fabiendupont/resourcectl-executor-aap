@@ -9,9 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/fabiendupont/infractl/workflow"
 )
+
+var testLogger = zerolog.Nop()
 
 func newTestClient(ts *httptest.Server) *Client {
 	client, _ := NewClient(ClientConfig{
@@ -44,7 +49,7 @@ func TestExecutorSubmitJobTemplate(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	exec := NewExecutor(newTestClient(ts))
+	exec := NewExecutor(newTestClient(ts), testLogger, ExecutorConfig{})
 
 	handler := workflow.Handler{Ref: "provision-vm"}
 	run, err := exec.Submit(context.Background(), handler, map[string]interface{}{"name": "test-vm"})
@@ -69,7 +74,7 @@ func TestExecutorSubmitWorkflowTemplate(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	exec := NewExecutor(newTestClient(ts))
+	exec := NewExecutor(newTestClient(ts), testLogger, ExecutorConfig{})
 
 	handler := workflow.Handler{
 		Ref:      "full-provision",
@@ -93,7 +98,7 @@ func TestExecutorPoll(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	exec := NewExecutor(newTestClient(ts))
+	exec := NewExecutor(newTestClient(ts), testLogger, ExecutorConfig{})
 
 	run, err := exec.Poll(context.Background(), "42")
 	if err != nil {
@@ -110,7 +115,7 @@ func TestExecutorPollFailed(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	exec := NewExecutor(newTestClient(ts))
+	exec := NewExecutor(newTestClient(ts), testLogger, ExecutorConfig{})
 
 	run, err := exec.Poll(context.Background(), "42")
 	if err != nil {
@@ -136,7 +141,7 @@ func TestExecutorCancel(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	exec := NewExecutor(newTestClient(ts))
+	exec := NewExecutor(newTestClient(ts), testLogger, ExecutorConfig{})
 
 	if err := exec.Cancel(context.Background(), "42"); err != nil {
 		t.Fatalf("Cancel: %v", err)
@@ -186,7 +191,7 @@ func TestRequestIDCorrelation(t *testing.T) {
 
 func TestOAuth2TokenRefresh(t *testing.T) {
 	tokenCalls := 0
-	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		tokenCalls++
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -227,9 +232,67 @@ func TestOAuth2TokenRefresh(t *testing.T) {
 		t.Errorf("token endpoint called %d times, want 1", tokenCalls)
 	}
 
-	// Second call should reuse cached token.
 	client.GetJob(context.Background(), "1")
 	if tokenCalls != 1 {
 		t.Errorf("token endpoint called %d times after cache, want 1", tokenCalls)
+	}
+}
+
+func TestRateLimiting(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(LaunchResponse{ID: 1})
+	}))
+	defer ts.Close()
+
+	exec := NewExecutor(newTestClient(ts), testLogger, ExecutorConfig{MaxInFlight: 1})
+
+	// First submit should work.
+	handler := workflow.Handler{Ref: "test"}
+	_, err := exec.Submit(context.Background(), handler, nil)
+	if err != nil {
+		t.Fatalf("first Submit: %v", err)
+	}
+
+	// Second submit should be rate limited (first job not released).
+	_, err = exec.Submit(context.Background(), handler, nil)
+	if err == nil {
+		t.Fatal("expected rate limit error on second submit")
+	}
+}
+
+func TestHealthCheck(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v2/ping/" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	exec := NewExecutor(newTestClient(ts), testLogger, ExecutorConfig{})
+
+	if err := exec.Healthy(context.Background()); err != nil {
+		t.Fatalf("Healthy: %v", err)
+	}
+}
+
+func TestDrain(t *testing.T) {
+	exec := NewExecutor(newTestClient(httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))), testLogger, ExecutorConfig{})
+
+	// No in-flight jobs — drain should complete immediately.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := exec.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	// After drain, submit should be rejected.
+	_, err := exec.Submit(context.Background(), workflow.Handler{Ref: "test"}, nil)
+	if err == nil {
+		t.Fatal("expected submit to be rejected after drain")
 	}
 }
