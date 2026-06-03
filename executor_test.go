@@ -13,6 +13,14 @@ import (
 	"github.com/fabiendupont/infractl/workflow"
 )
 
+func newTestClient(ts *httptest.Server) *Client {
+	client, _ := NewClient(ClientConfig{
+		BaseURL: ts.URL,
+		Auth:    &BearerTokenAuth{Token: "test-token"},
+	})
+	return client
+}
+
 func TestExecutorSubmitJobTemplate(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -20,6 +28,9 @@ func TestExecutorSubmitJobTemplate(t *testing.T) {
 		}
 		if r.URL.Path != "/api/v2/job_templates/provision-vm/launch/" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Errorf("missing or wrong auth header: %s", r.Header.Get("Authorization"))
 		}
 
 		var req LaunchRequest
@@ -33,8 +44,7 @@ func TestExecutorSubmitJobTemplate(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ClientConfig{BaseURL: ts.URL, Token: "test-token"})
-	exec := NewExecutor(client)
+	exec := NewExecutor(newTestClient(ts))
 
 	handler := workflow.Handler{Ref: "provision-vm"}
 	run, err := exec.Submit(context.Background(), handler, map[string]interface{}{"name": "test-vm"})
@@ -59,8 +69,7 @@ func TestExecutorSubmitWorkflowTemplate(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ClientConfig{BaseURL: ts.URL, Token: "test-token"})
-	exec := NewExecutor(client)
+	exec := NewExecutor(newTestClient(ts))
 
 	handler := workflow.Handler{
 		Ref:      "full-provision",
@@ -84,8 +93,7 @@ func TestExecutorPoll(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ClientConfig{BaseURL: ts.URL, Token: "test-token"})
-	exec := NewExecutor(client)
+	exec := NewExecutor(newTestClient(ts))
 
 	run, err := exec.Poll(context.Background(), "42")
 	if err != nil {
@@ -102,8 +110,7 @@ func TestExecutorPollFailed(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ClientConfig{BaseURL: ts.URL, Token: "test-token"})
-	exec := NewExecutor(client)
+	exec := NewExecutor(newTestClient(ts))
 
 	run, err := exec.Poll(context.Background(), "42")
 	if err != nil {
@@ -129,8 +136,7 @@ func TestExecutorCancel(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ClientConfig{BaseURL: ts.URL, Token: "test-token"})
-	exec := NewExecutor(client)
+	exec := NewExecutor(newTestClient(ts))
 
 	if err := exec.Cancel(context.Background(), "42"); err != nil {
 		t.Fatalf("Cancel: %v", err)
@@ -157,5 +163,73 @@ func TestMapAAPStatus(t *testing.T) {
 		if got != tt.expect {
 			t.Errorf("mapAAPStatus(%q) = %q, want %q", tt.aap, got, tt.expect)
 		}
+	}
+}
+
+func TestRequestIDCorrelation(t *testing.T) {
+	var receivedID string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedID = r.Header.Get("X-Request-ID")
+		json.NewEncoder(w).Encode(Job{ID: 1, Status: "successful"})
+	}))
+	defer ts.Close()
+
+	client := newTestClient(ts)
+
+	ctx := ContextWithRequestID(context.Background(), "req-abc-123")
+	client.GetJob(ctx, "1")
+
+	if receivedID != "req-abc-123" {
+		t.Errorf("X-Request-ID = %q, want %q", receivedID, "req-abc-123")
+	}
+}
+
+func TestOAuth2TokenRefresh(t *testing.T) {
+	tokenCalls := 0
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenCalls++
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token": "fresh-token",
+			"expires_in":   3600,
+			"token_type":   "Bearer",
+		})
+	}))
+	defer tokenServer.Close()
+
+	var receivedAuth string
+	aapServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		json.NewEncoder(w).Encode(Job{ID: 1, Status: "successful"})
+	}))
+	defer aapServer.Close()
+
+	auth := NewOAuth2Auth(OAuth2Config{
+		TokenURL:     tokenServer.URL,
+		ClientID:     "my-client",
+		ClientSecret: "my-secret",
+	}, http.DefaultClient)
+
+	client, err := NewClient(ClientConfig{
+		BaseURL: aapServer.URL,
+		Auth:    auth,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	client.GetJob(context.Background(), "1")
+
+	if receivedAuth != "Bearer fresh-token" {
+		t.Errorf("Authorization = %q, want %q", receivedAuth, "Bearer fresh-token")
+	}
+	if tokenCalls != 1 {
+		t.Errorf("token endpoint called %d times, want 1", tokenCalls)
+	}
+
+	// Second call should reuse cached token.
+	client.GetJob(context.Background(), "1")
+	if tokenCalls != 1 {
+		t.Errorf("token endpoint called %d times after cache, want 1", tokenCalls)
 	}
 }

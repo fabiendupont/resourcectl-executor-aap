@@ -15,30 +15,43 @@ import (
 
 // ClientConfig holds the AAP Controller connection parameters.
 type ClientConfig struct {
-	BaseURL  string
-	Token    string
-	Insecure bool
-	Timeout  time.Duration
+	BaseURL string
+	Auth    AuthMethod
+	TLS     TLSConfig
+	Timeout time.Duration
 }
 
 // Client talks to the AAP Controller REST API.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
-	token      string
+	auth       AuthMethod
 }
 
-// NewClient creates an AAP Controller client.
-func NewClient(cfg ClientConfig) *Client {
+// NewClient creates an AAP Controller client with TLS and auth configured.
+func NewClient(cfg ClientConfig) (*Client, error) {
 	timeout := cfg.Timeout
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
+
+	var transport http.RoundTripper = http.DefaultTransport
+
+	if cfg.TLS.CACert != "" || cfg.TLS.ClientCert != "" || cfg.TLS.Insecure {
+		t, err := NewTLSTransport(cfg.TLS)
+		if err != nil {
+			return nil, fmt.Errorf("configuring TLS: %w", err)
+		}
+		transport = t
+	}
+
+	transport = &correlationTransport{base: transport}
+
 	return &Client{
 		baseURL:    cfg.BaseURL,
-		token:      cfg.Token,
-		httpClient: &http.Client{Timeout: timeout},
-	}
+		auth:       cfg.Auth,
+		httpClient: &http.Client{Timeout: timeout, Transport: transport},
+	}, nil
 }
 
 // LaunchRequest is the payload for launching a job or workflow template.
@@ -83,7 +96,9 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (*Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.setHeaders(req)
+	if err := c.setHeaders(req); err != nil {
+		return nil, err
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -111,7 +126,9 @@ func (c *Client) CancelJob(ctx context.Context, jobID string) error {
 	if err != nil {
 		return err
 	}
-	c.setHeaders(req)
+	if err := c.setHeaders(req); err != nil {
+		return err
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -136,7 +153,9 @@ func (c *Client) launch(ctx context.Context, url string, launchReq LaunchRequest
 	if err != nil {
 		return nil, err
 	}
-	c.setHeaders(req)
+	if err := c.setHeaders(req); err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -157,7 +176,12 @@ func (c *Client) launch(ctx context.Context, url string, launchReq LaunchRequest
 	return &launchResp, nil
 }
 
-func (c *Client) setHeaders(req *http.Request) {
-	req.Header.Set("Authorization", "Bearer "+c.token)
+func (c *Client) setHeaders(req *http.Request) error {
+	if c.auth != nil {
+		if err := c.auth.SetAuth(req); err != nil {
+			return fmt.Errorf("setting auth: %w", err)
+		}
+	}
 	req.Header.Set("Accept", "application/json")
+	return nil
 }
