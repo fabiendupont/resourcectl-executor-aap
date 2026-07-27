@@ -1,4 +1,4 @@
-module github.com/fabiendupont/infractl-executor-aap
+module github.com/fabiendupont/resourcectl-executor-aap
 
 go 1.25.0
 
