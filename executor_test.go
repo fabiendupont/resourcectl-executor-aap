@@ -13,7 +13,7 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/fabiendupont/infractl/workflow"
+	"github.com/fabiendupont/resourcectl/workflow"
 )
 
 var testLogger = zerolog.Nop()

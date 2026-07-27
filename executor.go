@@ -17,7 +17,7 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/fabiendupont/infractl/workflow"
+	"github.com/fabiendupont/resourcectl/workflow"
 )
 
 // ExecutorConfig holds configuration for the AAP executor.
